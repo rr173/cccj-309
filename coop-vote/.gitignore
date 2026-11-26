@@ -8,4 +8,13 @@ coopvote.db-shm
 demo.db
 demo.db-wal
 demo.db-shm
+demo_treasury.db
+demo_treasury.db-wal
+demo_treasury.db-shm
+clearing.db
+clearing.db-wal
+clearing.db-shm
+demo_clearing.db
+demo_clearing.db-wal
+demo_clearing.db-shm
 bootstrap/

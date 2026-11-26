@@ -112,6 +112,12 @@ def settle_ballot(db_path: str, ballot_id: int) -> dict[str, Any]:
             "VALUES (?, ?, ?, ?, ?)",
             (ballot_id, totals["yes"], totals["no"], totals["abstain"], now),
         )
+        # 决议：只有赞成票多于反对票才通过；绑定的提案在同一事务内执行，
+        # 保证“票数固化 + 拨款/退款”原子生效，且同一决议不会重复执行。
+        from . import treasury
+
+        approved = totals["yes"] > totals["no"]
+        treasury.apply_proposal_decision(conn, ballot_id, approved, now)
         conn.execute(
             "UPDATE ballots SET status='settled', settled_at=? WHERE id=?",
             (now, ballot_id),

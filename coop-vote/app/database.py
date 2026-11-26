@@ -79,7 +79,84 @@ CREATE TABLE IF NOT EXISTS results (
     abstain_count INTEGER NOT NULL,
     settled_at    TEXT NOT NULL
 );
+
+-- 本地资金池：金额单位为整数分。
+-- 恒等式：deposited = available + reserved + paid
+--   available 可再分配；reserved 已被生效拨款保留（含受理中占用）；paid 已扣款出池
+CREATE TABLE IF NOT EXISTS fund_pool (
+    id               INTEGER PRIMARY KEY CHECK (id = 1),
+    deposited_cents  INTEGER NOT NULL DEFAULT 0,
+    reserved_cents   INTEGER NOT NULL DEFAULT 0,
+    paid_cents       INTEGER NOT NULL DEFAULT 0,
+    updated_at       TEXT NOT NULL
+);
+
+-- 提案：一场表决至多绑定一项；开放后冻结，不可新增/更改
+-- kind: allocate=拨款提案, revoke=撤销提案；status 反映结算后的处理结果
+CREATE TABLE IF NOT EXISTS proposals (
+    id              INTEGER PRIMARY KEY,
+    ballot_id       INTEGER NOT NULL UNIQUE REFERENCES ballots(id),
+    kind            TEXT NOT NULL CHECK (kind IN ('allocate', 'revoke')),
+    payee           TEXT,                          -- allocate 必填：固定收款方
+    max_amount_cents INTEGER,                      -- allocate 必填：拨款上限（正整数分）
+    grant_id        INTEGER,                       -- revoke 必填：要撤销的已生效拨款
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'approved', 'rejected',
+                                      'insufficient_funds', 'grant_gone')),
+    note            TEXT,
+    executed_at     TEXT,
+    CHECK (kind <> 'allocate' OR (payee IS NOT NULL AND max_amount_cents IS NOT NULL AND max_amount_cents > 0)),
+    CHECK (kind <> 'revoke' OR grant_id IS NOT NULL)
+);
+
+-- 已生效拨款：批准时从资金池保留全部额度
+CREATE TABLE IF NOT EXISTS grants (
+    id               INTEGER PRIMARY KEY,
+    proposal_id      INTEGER NOT NULL UNIQUE REFERENCES proposals(id),
+    ballot_id        INTEGER NOT NULL UNIQUE REFERENCES ballots(id),
+    payee            TEXT NOT NULL,
+    max_amount_cents INTEGER NOT NULL CHECK (max_amount_cents > 0),
+    reserved_cents   INTEGER NOT NULL,            -- 仍保留在拨款上的额度（含受理中占用）
+    paid_cents       INTEGER NOT NULL DEFAULT 0,  -- 已确认扣款
+    status           TEXT NOT NULL CHECK (status IN ('active', 'revoked')),
+    created_at       TEXT NOT NULL,
+    revoked_at       TEXT
+);
+
+-- 付款：同一拨款下请求号唯一；终态后任何重试都只回原记录
+CREATE TABLE IF NOT EXISTS payments (
+    id               INTEGER PRIMARY KEY,
+    grant_id         INTEGER NOT NULL REFERENCES grants(id),
+    request_no       TEXT NOT NULL,
+    payee            TEXT NOT NULL,               -- 受理时固定的收款方快照
+    amount_cents     INTEGER NOT NULL CHECK (amount_cents > 0),
+    clearing_ref     TEXT NOT NULL UNIQUE,        -- 清算端幂等键，重启后也不变
+    status           TEXT NOT NULL
+                     CHECK (status IN ('accepted', 'paid', 'failed')),
+    clearing_status  TEXT,                        -- 清算端最近一次返回的原始状态
+    detail           TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    UNIQUE (grant_id, request_no)
+);
+CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 """
+
+
+def seed_fund_pool(db_path: str) -> None:
+    """确保资金池单行存在（幂等，不改动既有金额）。"""
+    from .service import utc_now
+
+    conn = connect(db_path)
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO fund_pool(id, deposited_cents, reserved_cents, paid_cents, updated_at) "
+            "VALUES (1, 0, 0, 0, ?)",
+            (utc_now(),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -96,9 +173,14 @@ def init_db(db_path: str) -> None:
     conn = connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        # 轻量迁移：旧版本库没有 paid_cents 列时自动补上
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(fund_pool)").fetchall()}
+        if "paid_cents" not in cols:
+            conn.execute("ALTER TABLE fund_pool ADD COLUMN paid_cents INTEGER NOT NULL DEFAULT 0")
         conn.commit()
     finally:
         conn.close()
+    seed_fund_pool(db_path)
 
 
 @contextmanager

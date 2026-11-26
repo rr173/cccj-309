@@ -87,3 +87,72 @@ class PublicBallotOut(BaseModel):
     title: str
     status: str
     results: Optional[Results] = None
+
+
+# ---------------------------------------------------------------- 资金/拨款
+class DepositIn(BaseModel):
+    amount_cents: int = Field(gt=0, description="入金金额，正整数分")
+
+
+class PoolOut(BaseModel):
+    deposited_cents: int
+    reserved_cents: int
+    paid_cents: int
+    available_cents: int
+    updated_at: str
+
+
+class AllocateProposalIn(BaseModel):
+    payee: str = Field(min_length=1, max_length=128, description="固定收款方")
+    max_amount_cents: int = Field(gt=0, description="拨款上限，正整数分")
+
+
+class RevokeProposalIn(BaseModel):
+    grant_id: int = Field(gt=0)
+
+
+class ProposalOut(BaseModel):
+    id: int
+    ballot_id: int
+    kind: Literal["allocate", "revoke"]
+    payee: Optional[str] = None
+    max_amount_cents: Optional[int] = None
+    grant_id: Optional[int] = None
+    status: str
+    note: Optional[str] = None
+    executed_at: Optional[str] = None
+    resulting_grant_id: Optional[int] = None
+
+
+class GrantOut(BaseModel):
+    id: int
+    ballot_id: int
+    proposal_id: int
+    payee: str
+    status: Literal["active", "revoked"]
+    max_amount_cents: int
+    reserved_cents: int
+    paid_cents: int
+    accepted_pending_cents: int
+    available_for_payment_cents: int
+    effective: bool
+    created_at: str
+    revoked_at: Optional[str] = None
+
+
+class PaymentIn(BaseModel):
+    request_no: str = Field(min_length=1, max_length=128)
+    amount_cents: int = Field(gt=0, description="单笔付款，正整数分")
+
+
+class PaymentOut(BaseModel):
+    id: int
+    grant_id: int
+    request_no: str
+    payee: str
+    amount_cents: int
+    status: Literal["accepted", "paid", "failed"]
+    clearing_ref: str
+    detail: Optional[str] = None
+    created_at: str
+    updated_at: str
