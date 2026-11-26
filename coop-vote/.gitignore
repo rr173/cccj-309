@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+coopvote.db
+coopvote.db-wal
+coopvote.db-shm
+demo.db
+demo.db-wal
+demo.db-shm
+bootstrap/
