@@ -237,6 +237,168 @@ CREATE TABLE IF NOT EXISTS equipment_loans (
 CREATE INDEX IF NOT EXISTS idx_loans_equipment_open
     ON equipment_loans(equipment_id, returned_at);
 CREATE INDEX IF NOT EXISTS idx_loans_reservation ON equipment_loans(reservation_id);
+
+-- ---------------------------------------------------------------- 批次库存
+-- case_count 是仍在库、尚未交货的箱数（含已备货占用）；
+-- available = case_count - status='prepared' 单据上的分配箱数。
+CREATE TABLE IF NOT EXISTS inv_batches (
+    id              INTEGER PRIMARY KEY,
+    batch_no        TEXT NOT NULL UNIQUE,
+    variety         TEXT NOT NULL,
+    origin          TEXT NOT NULL DEFAULT 'inbound'
+                    CHECK (origin IN ('inbound', 'composed')),
+    initial_cases   INTEGER NOT NULL CHECK (initial_cases > 0),
+    case_count      INTEGER NOT NULL CHECK (case_count >= 0),
+    delivered_cases INTEGER NOT NULL DEFAULT 0 CHECK (delivered_cases >= 0),
+    note            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_inv_batches_variety ON inv_batches(variety);
+
+-- 一次“从一个或多个批次拆出并合成新批次”的操作及实际投入箱数。
+CREATE TABLE IF NOT EXISTS inv_compositions (
+    id           INTEGER PRIMARY KEY,
+    new_batch_id INTEGER NOT NULL UNIQUE REFERENCES inv_batches(id),
+    total_cases  INTEGER NOT NULL CHECK (total_cases > 0),
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inv_composition_items (
+    id             INTEGER PRIMARY KEY,
+    composition_id INTEGER NOT NULL REFERENCES inv_compositions(id) ON DELETE CASCADE,
+    source_batch_id INTEGER NOT NULL REFERENCES inv_batches(id),
+    cases          INTEGER NOT NULL CHECK (cases > 0),
+    UNIQUE (composition_id, source_batch_id)
+);
+
+-- 来源闭包：(batch_id, source_batch_id) 表示 batch_id 的每一箱都接触过
+-- source_batch_id；每个批次也插入自反行，便于一次查出目标批次及其全部后代。
+CREATE TABLE IF NOT EXISTS inv_batch_sources (
+    batch_id        INTEGER NOT NULL REFERENCES inv_batches(id) ON DELETE CASCADE,
+    source_batch_id INTEGER NOT NULL REFERENCES inv_batches(id),
+    PRIMARY KEY (batch_id, source_batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_batch_sources_source
+    ON inv_batch_sources(source_batch_id);
+
+-- 出库单：pending=待备货（分配行只是预案，不占用）；prepared=已备货/已占用；
+-- delivered=整单已交货；cancelled=未交货取消并释放占用。
+CREATE TABLE IF NOT EXISTS inv_outbound_orders (
+    id           INTEGER PRIMARY KEY,
+    order_no     TEXT UNIQUE,
+    buyer_name   TEXT NOT NULL,
+    buyer_code   TEXT NOT NULL DEFAULT '',
+    variety      TEXT NOT NULL,
+    total_cases  INTEGER NOT NULL CHECK (total_cases > 0),
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'prepared', 'delivered', 'cancelled')),
+    note         TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    prepared_at  TEXT,
+    delivered_at TEXT,
+    cancelled_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_inv_orders_status ON inv_outbound_orders(status, id);
+CREATE INDEX IF NOT EXISTS idx_inv_orders_buyer ON inv_outbound_orders(buyer_name);
+
+CREATE TABLE IF NOT EXISTS inv_outbound_allocations (
+    id                 INTEGER PRIMARY KEY,
+    order_id           INTEGER NOT NULL REFERENCES inv_outbound_orders(id) ON DELETE CASCADE,
+    batch_id           INTEGER NOT NULL REFERENCES inv_batches(id),
+    cases              INTEGER NOT NULL CHECK (cases > 0),
+    batch_no_snapshot  TEXT NOT NULL,
+    variety_snapshot   TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    updated_at         TEXT NOT NULL,
+    UNIQUE (order_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_allocations_batch
+    ON inv_outbound_allocations(batch_id);
+
+-- 交货时固化的实际出库明细；即使后续审计/展示逻辑变化，召回仍以这些行为准。
+CREATE TABLE IF NOT EXISTS inv_deliveries (
+    id           INTEGER PRIMARY KEY,
+    order_id     INTEGER NOT NULL UNIQUE REFERENCES inv_outbound_orders(id),
+    delivered_at TEXT NOT NULL,
+    note         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS inv_delivery_items (
+    id            INTEGER PRIMARY KEY,
+    delivery_id   INTEGER NOT NULL REFERENCES inv_deliveries(id) ON DELETE CASCADE,
+    order_id      INTEGER NOT NULL REFERENCES inv_outbound_orders(id),
+    allocation_id INTEGER REFERENCES inv_outbound_allocations(id),
+    batch_id      INTEGER NOT NULL REFERENCES inv_batches(id),
+    batch_no      TEXT NOT NULL,
+    variety       TEXT NOT NULL,
+    cases         INTEGER NOT NULL CHECK (cases > 0),
+    UNIQUE (order_id, allocation_id),
+    UNIQUE (delivery_id, batch_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_delivery_items_batch
+    ON inv_delivery_items(batch_id);
+
+-- 独立质量事件；同一目标可登记多个事件，全部解除后隔离才结束。
+CREATE TABLE IF NOT EXISTS inv_quality_events (
+    id              INTEGER PRIMARY KEY,
+    event_no        TEXT UNIQUE,
+    target_batch_id INTEGER NOT NULL REFERENCES inv_batches(id),
+    title           TEXT NOT NULL DEFAULT '',
+    reason          TEXT NOT NULL DEFAULT '',
+    severity        TEXT NOT NULL DEFAULT 'normal',
+    status          TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'resolved')),
+    created_at      TEXT NOT NULL,
+    resolved_at     TEXT,
+    resolution_note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_inv_quality_events_target
+    ON inv_quality_events(target_batch_id, status);
+
+-- 事件登记时形成的召回单（事件 × 已交货订单唯一）和受影响交付明细快照。
+CREATE TABLE IF NOT EXISTS inv_recall_cases (
+    id             INTEGER PRIMARY KEY,
+    event_id       INTEGER NOT NULL REFERENCES inv_quality_events(id) ON DELETE CASCADE,
+    order_id       INTEGER NOT NULL REFERENCES inv_outbound_orders(id),
+    order_no       TEXT NOT NULL,
+    buyer_name     TEXT NOT NULL,
+    contacted      INTEGER NOT NULL DEFAULT 0,
+    contact_note   TEXT NOT NULL DEFAULT '',
+    contacted_by   TEXT NOT NULL DEFAULT '',
+    contact_count  INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT NOT NULL,
+    contacted_at   TEXT,
+    last_contacted_at TEXT,
+    UNIQUE (event_id, order_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_recall_cases_contact
+    ON inv_recall_cases(event_id, contacted);
+
+CREATE TABLE IF NOT EXISTS inv_recall_items (
+    id               INTEGER PRIMARY KEY,
+    case_id          INTEGER NOT NULL REFERENCES inv_recall_cases(id) ON DELETE CASCADE,
+    event_id         INTEGER NOT NULL REFERENCES inv_quality_events(id) ON DELETE CASCADE,
+    order_id         INTEGER NOT NULL REFERENCES inv_outbound_orders(id),
+    delivery_item_id INTEGER NOT NULL REFERENCES inv_delivery_items(id),
+    batch_id         INTEGER NOT NULL REFERENCES inv_batches(id),
+    batch_no         TEXT NOT NULL,
+    variety          TEXT NOT NULL,
+    cases            INTEGER NOT NULL CHECK (cases > 0),
+    UNIQUE (event_id, delivery_item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_inv_recall_items_event ON inv_recall_items(event_id);
+
+-- 审计：质量事件把哪些已备货单整单退回待备货。
+CREATE TABLE IF NOT EXISTS inv_event_order_actions (
+    id         INTEGER PRIMARY KEY,
+    event_id   INTEGER NOT NULL REFERENCES inv_quality_events(id) ON DELETE CASCADE,
+    order_id   INTEGER NOT NULL REFERENCES inv_outbound_orders(id),
+    action     TEXT NOT NULL CHECK (action IN ('returned_to_pending')),
+    created_at TEXT NOT NULL,
+    UNIQUE (event_id, order_id, action)
+);
 """
 
 

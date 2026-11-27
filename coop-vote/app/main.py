@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request
 
 from . import equipment, service, treasury
+from .inventory_api import router as inventory_router
 from .clearing.app import create_clearing_app
 from .clearing_client import ClearingClient
 from .config import get_settings
@@ -105,11 +106,11 @@ def create_app(
             clearing_client.close()
 
     app = FastAPI(
-        title="合作社匿名表决后端",
-        version="1.1.0",
+        title="合作社匿名表决与农产品库存后端",
+        version="1.2.0",
         description=(
             "本地会员身份 + 服务签发投票凭证；三选项、冻结名册、停权/恢复、匿名计票；"
-            "表决可绑定拨款/撤销提案，结算即按决议办理本地资金池拨款与付款。"
+            "表决可绑定拨款/撤销提案；并提供农产品批次拆并、出库、隔离与召回办理。"
         ),
         lifespan=lifespan,
     )
@@ -121,6 +122,11 @@ def create_app(
         from fastapi.responses import JSONResponse
 
         return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    # 批次入库、拆并、出库、质量隔离与召回（全部仅管理员）。
+    app.include_router(inventory_router)
+    # 兼容部分本地调用方使用的 /api/admin/... 前缀。
+    app.include_router(inventory_router, prefix="/api", include_in_schema=False)
 
     def require_member(member=Depends(authenticate_member)):
         if member is None:

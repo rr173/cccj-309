@@ -166,6 +166,85 @@ python3 -m pytest -q
 逐件归还、到期未还阻断承诺、实际归还后递补、维修不等于归还、重启持久化、
 并发预约不超额确认、并发交接只产生一组借约。
 
+## 批次出库与召回（本地库存接口）
+
+这部分只使用 SQLite 与本地管理员令牌，不接外部仓储、通知或收款系统。
+所有写操作都在单个 `BEGIN IMMEDIATE` 事务中完成，并复用进程内全局写锁，
+因此拆并、备货、交货、取消和质量事件的并发结果都对应一个确定的服务端
+受理顺序；不会出现半单备货、半单交货或半单释放。
+
+### 业务规则与实现对照
+
+| 需求 | 实现 |
+| --- | --- |
+| 入库登记批次号、品种、正整数箱数 | `inv_batches`；批次号唯一，Pydantic/服务层与 `CHECK(cases > 0)` 双重校验 |
+| 同品种未占用、未隔离库存可从一个或多个批次拆出并合成新批次 | `POST /admin/batches/merge`（兼容 `/split`）；逐批次校验品种、隔离状态和 `case_count - prepared 占用` |
+| 未取用余量留在原批次，总箱数不增加 | 同一事务内按投入箱数扣减来源批次、按总投入创建新批次；拆并前后所有在库批次箱数守恒 |
+| 新批次每一箱接触本次全部投入，后续拆并保留来源 | `inv_batch_sources` 保存含自反行的来源闭包；新批次复制每个来源的全部祖先 |
+| 已交货库存不能再拆并或出库 | 交货同事务扣减 `case_count` 并增加 `delivered_cases`；可用量只按剩余在库箱数计算 |
+| 出库单注明买家、品种、总箱数 | `inv_outbound_orders`；买家可传字符串或 `{name, code}`，也可传本地会员 code/id |
+| 可逐单指定批次箱数，凑齐后备货 | `PUT/POST .../allocations` 可保存部分分配；`.../prepare` 校验分配总和等于总箱数 |
+| 备货占用箱数 | 占用量由分配行与 `status='prepared'` 单据实时汇总，不另存可能不一致的占用列 |
+| 确认交货时整单出库并保留实际批次/箱数 | `.../deliver` 在一个事务内扣库存、写 `inv_deliveries` 与 `inv_delivery_items`，订单置 `delivered` |
+| 可取消未交货订单并释放占用 | `.../cancel`；`pending/prepared` 可取消，取消幂等，占用汇总随即排除该单 |
+| 可对任意批次登记独立质量事件 | `inv_quality_events`；同一批次可登记多个事件，各有独立编号、说明、状态 |
+| 目标批次及直接/间接后代在事件全部解除前被隔离 | 用来源闭包一次查出目标自身及全部后代；拆并、备货、交货均检查是否存在任一 active 事件 |
+| 已备货未交货单含受影响批次时整单退回并释放全部占用 | 事件事务内把所有相关 `prepared` 单改为 `pending`、清空 `prepared_at`；状态改变即释放该单所有批次占用 |
+| 解除事件不自动恢复备货 | 事件仅置 `resolved`；被退回单保持 `pending`，须管理员重新 prepare |
+| 已交货单按事件列出买家、出库单、实际受影响批次和箱数 | 登记事件时写 `inv_recall_cases/items` 快照，来源是交货时固化的 `inv_delivery_items` |
+| 同一交付明细经多条来源路径受影响只计一次 | 先求受影响批次集合再查明细；`UNIQUE(event_id, delivery_item_id)` 兜底去重 |
+| 解除后不抹去召回清单 | 解除只改事件状态/时间；召回快照与联系记录保留，仍可通过事件或 `/admin/recalls` 查询 |
+| 每张受影响订单可记录已联系；同订单多事件状态独立 | `inv_recall_cases` 对 `(event_id, order_id)` 唯一，含 `contacted/contacted_at/contact_note/contact_count` |
+| 重启后继续办理和核对 | 全部状态、来源闭包、交货明细、召回快照和联系记录均在 SQLite |
+
+### 库存接口
+
+所有接口都需要管理员的 `X-Member-Token`（或 `Authorization: Bearer <token>`）。
+下列为规范路径；同时提供 `/admin/lots`、`/admin/orders`、`/admin/shipments`、
+`/admin/quality-incidents`、`/api/admin/...` 等常见别名。
+
+| 方法/路径 | 说明 |
+| --- | --- |
+| `POST /admin/batches` | 入库：`{batch_no?, variety, cases, note?}`；不传批次号时生成 `B-000001` |
+| `GET /admin/batches?variety=&quarantined=&available_only=` | 批次当前箱数、占用、可用量、隔离事件和来源 |
+| `GET /admin/batches/{batch_no或id}` | 批次详情 |
+| `GET /admin/batches/{batch_no或id}/lineage` | 全部祖先来源与直接/间接后代 |
+| `POST /admin/batches/merge` | 拆并：`{new_batch_no?, variety?, sources:[{batch_no或batch_id,cases}]}` |
+| `POST /admin/batches/split` | 与 `/merge` 相同的兼容别名 |
+| `POST /admin/batches/{id}/split` | 单来源拆分，body 至少含 `{cases, new_batch_no?}` |
+| `POST /admin/outbound-orders` | 建出库单：`{buyer, variety, total_cases, order_no?, allocations?, prepare?}` |
+| `GET /admin/outbound-orders?status=&buyer=&variety=` | 出库单及分配/交货明细 |
+| `GET /admin/outbound-orders/{id}` | 出库单详情 |
+| `PUT /admin/outbound-orders/{id}/allocations` | 覆盖保存批次分配（可暂未凑齐，不占用）；也接受裸数组 |
+| `POST /admin/outbound-orders/{id}/allocations` | 新增/更新单个批次分配；传完整 `{allocations:[...]}` 时覆盖 |
+| `POST /admin/outbound-orders/{id}/prepare` | 带可选 allocations，凑齐、校验隔离和可用量后整单备货占用 |
+| `POST /admin/outbound-orders/{id}/allocate` | 指定分配并备货的便捷动作；也可继续使用 `/prepare` |
+| `POST /admin/outbound-orders/{id}/deliver` | 整单确认交货；重试幂等，不重复扣库存 |
+| `POST /admin/outbound-orders/{id}/cancel` | 取消未交货订单并释放占用；重复取消幂等 |
+| `POST /admin/quality-events` | 登记事件：`{batch_no或batch_id, title?, reason?, severity?, event_no?}` |
+| `POST /admin/batches/{id}/quality-events` | 为路径指定批次登记事件 |
+| `GET /admin/quality-events?active_only=&status=` | 事件、受影响批次、退回单和召回清单 |
+| `GET /admin/quality-events/{id}` | 事件详情 |
+| `POST /admin/quality-events/{id}/resolve` | 解除事件：`{resolution_note?}`；不删除召回/联系记录 |
+| `GET /admin/quality-events/{id}/recalls` | 该事件形成的召回单 |
+| `GET /admin/recalls?event_id=&order_id=&contacted=&buyer=` | 全部召回联系清单 |
+| `GET /admin/recalls/{id}` | 召回单及受影响交付明细 |
+| `POST /admin/recalls/{id}/contact` | 记录联系：`{contacted?, note?, contacted_by?}`，重复联系保留首次时间并累加次数 |
+| `POST /admin/quality-events/{event_id}/orders/{order_id}/contact` | 按“事件 × 订单”记录独立联系状态 |
+| `POST /admin/orders/{order_id}/contact` | 订单涉及唯一召回事件时可直接联系；多事件须在 body 传 `event_id` |
+| `GET /admin/inventory/summary` | 批次、订单和质量事件的汇总核对视图 |
+
+本地演示与专项测试：
+
+```bash
+python3 demo_inventory.py
+python3 -m pytest tests/test_inventory.py -q
+```
+
+专项测试覆盖拆并守恒与多层来源、备货占用/取消释放、部分分配凑齐、交货扣减
+与幂等重试、质量事件整单退回、多事件隔离、菱形来源去重、按事件召回买家和
+实际批次箱数、联系状态独立、并发备货不超额以及重启持久化。
+
 ## 数据模型（SQLite）
 
 主库 `coopvote.db`：
@@ -182,6 +261,10 @@ python3 -m pytest -q
 - `reservations` / `reservation_items` / `reservation_item_tags`：会员成套预约与清单。
 - `reservation_assignments`：未领取确认单的可重算派工方案，不是序列号锁。
 - `equipment_loans`：交接后的逐件实物借还记录、约定到期时间与实际归还时间。
+- `inv_batches` / `inv_compositions` / `inv_composition_items` / `inv_batch_sources`：农产品批次、拆并投入与多层来源闭包。
+- `inv_outbound_orders` / `inv_outbound_allocations`：买家出库单和批次分配；`prepared` 分配构成库存占用。
+- `inv_deliveries` / `inv_delivery_items`：交货时固化的实际批次与箱数。
+- `inv_quality_events` / `inv_recall_cases` / `inv_recall_items` / `inv_event_order_actions`：独立质量事件、召回快照、按事件/订单独立的联系状态和整单退回审计。
 
 清算库 `clearing.db`：`clearing_payments`（按 `ref` 去重的流水）、
 `sim_controls`（故障注入开关）。
@@ -206,6 +289,7 @@ python3 bootstrap/get-pip.py  # 如已自带 pip 可跳过
 # 4) 不启服务的完整故事线演示（脚本会自己拉起清算端）
 .venv/bin/python demo.py            # 原有匿名表决演示
 .venv/bin/python demo_treasury.py   # 拨款/付款/失联/重启/撤销全流程
+.venv/bin/python demo_inventory.py  # 批次拆并/备货交货/隔离召回全流程
 
 # 5) 跑测试
 .venv/bin/python -m pytest -q

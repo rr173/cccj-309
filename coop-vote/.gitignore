@@ -20,4 +20,7 @@ demo_clearing.db-shm
 demo_equipment.db
 demo_equipment.db-wal
 demo_equipment.db-shm
+demo_inventory.db
+demo_inventory.db-wal
+demo_inventory.db-shm
 bootstrap/
