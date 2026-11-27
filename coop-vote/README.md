@@ -79,6 +79,93 @@ deposited_cents = available_cents + reserved_cents + paid_cents
 - 服务重启不丢失受理中付款（已持久化），启动时与后台线程定期对账，
   清算端恢复后凭同一 `ref` 查询/重试补齐终态；清算端去重保证不会付两次。
 
+## 机具成套预约与实物出借（本地办理接口）
+
+这部分完全复用 `members` 本地会员身份与 `X-Member-Token`（也兼容
+`Authorization: Bearer <token>`），不接外部系统、不涉及收费。所有状态推进都是
+懒触发：预约、维修、交接、归还以及任意状态查询都会在同一个 SQLite 写事务中
+先处理到期/逾期并重算递补，因此不需要额外定时服务。
+
+### 业务规则与实现对照
+
+| 需求 | 实现 |
+| --- | --- |
+| 管理员登记独立编号和能力标签 | `equipment.asset_no UNIQUE` + `equipment_tags`；编号可传 `asset_no/asset_code/code/serial_number` 等常见别名 |
+| 一张单是一整套，每项要求全部标签 | `reservation_items` + `reservation_item_tags`；求解时要求请求标签集合是机具标签集合的子集 |
+| 同一台机具不能在同一套中充当两件 | 同一预约的各清单项时间区间相同，求解器将重叠要求视为冲突；手工指定交接号也校验去重 |
+| 同一台机具必须覆盖整段借期/剩余借期 | 候选机具必须在整个 `[max(starts_at, now), ends_at)` 内无维修、硬借约或逾期不可承诺区间 |
+| 区间左闭右开 | 统一用 `a.start < b.end and b.start < a.end` 判重叠；端点相接可复用 |
+| 预约开始不得早于服务端当前时间 | 创建事务内用服务端 UTC 时钟比较；相等允许 |
+| 只有能与其他确认单共同兑现才确认，否则整单等候 | 每次重算都对“已保留订单 + 当前订单”求整套派工；任一清单项无解则整单不进入确认集合 |
+| 确认的是可领齐，不锁序列号 | `reservation_assignments` 只是可重算的派工方案；未领取单在可用性变化时可整体改派 |
+| 先保留旧确认，再递补等候，均按最初受理 ID 排序 | 两趟处理：先 `confirmed`，再当前全部 `waiting`；ID 即 SQLite 受理顺序 |
+| 无法在不牺牲更早订单时满足就略过并继续 | 每个候选单都在“此前已保留集合”上求解；失败只跳过/降级该单，不影响后续与其他订单相容的单 |
+| 会员可取消尚未领取的本人预约 | `POST /me/equipment/reservations/{id}/cancel`；已交接单不能取消，重复取消幂等 |
+| 未领取且到结束时间即失效 | 查询/办理时把 `ends_at <= server_now` 的 `waiting/confirmed` 置为 `expired`，随后释放能力并递补 |
+| 管理员在借用时段一次交接并由系统给实物号 | `POST /admin/reservations/{id}/handover`；空体即按当前可行方案一次创建全部 `equipment_loans` |
+| 手工选择的机具不能破坏其他确认单 | 先校验本单标签/唯一性/剩余借期，再把所选实物作为额外硬占用，对其他全部确认单重新求解；失败整笔回滚 |
+| 已交接实物不能改派 | 自动重算只改 `reservation_assignments`；未归还 `equipment_loans` 是求解器硬占用 |
+| 可逐件归还 | 每个清单项/实物一行 loan；`POST /admin/loans/{loan_id}/return` 或 `POST /admin/equipment/returns` |
+| 未到期外借预计结束时可再用 | 未逾期 loan 只形成 `[checked_out_at, due_at)` 占用；相接的下一预约可确认 |
+| 到期未还不能再承诺，直到实际归还 | `now >= due_at AND returned_at IS NULL` 的机具进入 `overdue` 集合，对任何新派工都不可候选；实际归还后立即恢复并递补 |
+| 维修不会把会员手中机具视为归还 | 维修窗口与未还 loan 分别存储；登记/撤销维修绝不写 `returned_at` |
+| 查看时反映逾期、失效和递补 | 所有会员/管理查询入口均在事务内执行 `_tick()` 后再组装响应 |
+| 并发状态对应服务端接受顺序 | 沿用全局写锁 + `BEGIN IMMEDIATE`；预约、维修、交接、归还均在单事务内完成“推进—校验—落库—重算” |
+| 重启不丢承诺和未还实物 | 全部状态在 SQLite 表中；无内存派工/借约状态 |
+
+派工求解器在小规模本地机具集合上使用 MRV 回溯，并用时间原子段上的二分匹配
+做 Hall/容量剪枝，确保不是只按标签数量粗略判断。
+
+### 机具接口
+
+| 方法/路径 | 鉴权 | 说明 |
+| --- | --- | --- |
+| `POST /admin/equipment` | 管理员 | 登记 `{asset_no, name?, tags[]}`；`/admin/machines`、`/admin/tools`、`/admin/assets` 为别名 |
+| `GET /admin/equipment` | 管理员 | 机具标签、当前 `available/on_loan/overdue/maintenance` 状态、维修窗口、当前借用人 |
+| `GET /admin/equipment/{id}` | 管理员 | 机具详情 |
+| `GET /admin/equipment/by-asset/{asset_no}` | 管理员 | 按独立编号查询 |
+| `POST /admin/maintenance` | 管理员 | 用 `equipment_id` 或 `asset_no` 登记 `{starts_at, ends_at, reason?}` |
+| `POST /admin/equipment/{id}/maintenance` | 管理员 | 为指定机具登记维修时段 |
+| `GET /admin/maintenance` | 管理员 | 维修时段及当前是否生效 |
+| `POST/DELETE /admin/maintenance/{id}/revoke` | 管理员 | 撤销维修时段，随后立即重算保留/递补 |
+| `GET /admin/reservations?status=&member_code=` | 管理员 | 全部预约、清单项、计划实物、实际借还与逾期信息 |
+| `GET /admin/reservations/{id}` | 管理员 | 单笔预约办理视图 |
+| `POST /admin/reservations/{id}/handover` | 管理员 | 在借用时段内一次领齐；可空体由系统选号，也可传 `{asset_nos:[...]}` 或 `{equipment_ids:[...]}`；`checkout/pickup/collect` 为路径别名 |
+| `GET /admin/loans?open=true&returned=true&overdue=true` | 管理员 | 核对实际领出/归还/逾期实物 |
+| `POST /admin/loans/{loan_id}/return` | 管理员 | 逐件归还 |
+| `POST /admin/equipment/returns` | 管理员 | 用 `{loan_id}` 或 `{asset_no}` 归还一件，重试幂等 |
+
+### 会员预约接口
+
+| 方法/路径 | 鉴权 | 说明 |
+| --- | --- | --- |
+| `POST /me/equipment/reservations` | 会员 | body：`{starts_at, ends_at, items:[{label?, tags:[]}]}`；也接受 `start/end`、`required_tags`、标签二维数组等常见写法 |
+| `GET /me/equipment/reservations` | 会员 | 只列本人预约；每次查询先做失效/逾期/递补推进 |
+| `GET /me/equipment/reservations/{id}` | 会员 | 查 `waiting/confirmed/cancelled/expired/collected/returned`、中文 `status_label`、是否逾期、计划号或实际实物号 |
+| `POST /me/equipment/reservations/{id}/cancel` | 会员 | 取消本人尚未领取的预约并触发递补；`DELETE` 同路径也可 |
+
+`/me/reservations/**` 与 `/reservations/**` 是兼容别名。会员访问他人预约返回
+404，不泄露预约是否存在。
+
+### 本地演示与测试
+
+```bash
+# 不依赖表决/清算外部进程；演示使用 TestClient 和可控演示时钟
+python3 demo_equipment.py
+
+# 机具专项测试
+python3 -m pytest tests/test_equipment.py -q
+
+# 全部现有 + 新增测试
+python3 -m pytest -q
+```
+
+机具专项测试覆盖：整套确认/等候、同机不能充当两件、全标签匹配、区间相接、
+开始时间校验、取消递补顺序、懒失效与剩余借期、维修导致降级/撤销后递补、
+跳过无法满足的一单且继续保留后续单、一次交接、手工选号不得破坏其他确认、
+逐件归还、到期未还阻断承诺、实际归还后递补、维修不等于归还、重启持久化、
+并发预约不超额确认、并发交接只产生一组借约。
+
 ## 数据模型（SQLite）
 
 主库 `coopvote.db`：
@@ -90,6 +177,11 @@ deposited_cents = available_cents + reserved_cents + paid_cents
 - `proposals`：提案（`allocate`/`revoke`），与表决一一对应，含执行结果状态。
 - `grants`：已生效拨款（保留额、已付额、`active/revoked`）。
 - `payments`：付款（请求号唯一、清算幂等键 `clearing_ref` 唯一、三态状态机）。
+- `equipment` / `equipment_tags`：实物机具独立编号与能力标签。
+- `maintenance_windows`：维修停用时段（`active/revoked`，撤销保留审计行）。
+- `reservations` / `reservation_items` / `reservation_item_tags`：会员成套预约与清单。
+- `reservation_assignments`：未领取确认单的可重算派工方案，不是序列号锁。
+- `equipment_loans`：交接后的逐件实物借还记录、约定到期时间与实际归还时间。
 
 清算库 `clearing.db`：`clearing_payments`（按 `ref` 去重的流水）、
 `sim_controls`（故障注入开关）。
@@ -161,7 +253,7 @@ python3 bootstrap/get-pip.py  # 如已自带 pip 可跳过
 
 系统**不新增**任何按会员查询投票选择的入口；匿名规则与公开结果口径保持不变。
 
-## 测试覆盖（47 项）
+## 测试覆盖（63 项）
 
 - `tests/test_lifecycle.py`：冻结范围、重领不增资格、改投覆盖、停权/恢复、结算固化。
 - `tests/test_privacy.py`：名册无选择字段、投票响应无身份、令牌不能当凭证、公开端无逐票信息。
@@ -172,6 +264,9 @@ python3 bootstrap/get-pip.py  # 如已自带 pip 可跳过
   扣款后断连不判失败、宕机受理、恢复对账、清算端去重、重启不丢不重复付。
 - `tests/test_treasury_concurrency.py`：并发付款不超额、同请求号并发不重复占用、
   撤销 vs 付款两种受理顺序、多提案争同一余额。
+- `tests/test_equipment.py`：成套预约可行性、标签/同机冲突/左闭右开区间、
+  取消与失效后的顺序递补、维修停用与撤销、确认保留/跳过/改派、实物交接选号
+  保护其他确认、逐件归还、逾期未还阻断与归还恢复、重启持久化和并发交接。
 
 ## 安全边界说明
 

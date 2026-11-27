@@ -17,11 +17,18 @@ from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, Request
 
-from . import service, treasury
+from . import equipment, service, treasury
 from .clearing.app import create_clearing_app
 from .clearing_client import ClearingClient
 from .config import get_settings
 from .database import init_db
+from .equipment_schemas import (
+    EquipmentCreate,
+    HandoverIn,
+    MaintenanceCreate,
+    ReservationCreate,
+    ReturnIn,
+)
 from .schemas import (
     AllocateProposalIn,
     BallotCreate,
@@ -267,6 +274,199 @@ def create_app(
     def admin_reconcile_all(admin=Depends(require_admin)):
         return treasury.reconcile_pending(
             app.state.settings.db_path, app.state.clearing
+        )
+
+    # ------------------------------------------------------------ 机具：管理员登记/维修
+    @app.post("/admin/equipment", status_code=201)
+    @app.post("/admin/machines", status_code=201, include_in_schema=False)
+    @app.post("/admin/tools", status_code=201, include_in_schema=False)
+    @app.post("/admin/assets", status_code=201, include_in_schema=False)
+    def admin_create_equipment(body: EquipmentCreate, admin=Depends(require_admin)):
+        return equipment.create_equipment(
+            app.state.settings.db_path,
+            body.asset_no,
+            body.tags,
+            body.name,
+        )
+
+    @app.get("/admin/equipment")
+    @app.get("/admin/machines", include_in_schema=False)
+    @app.get("/admin/tools", include_in_schema=False)
+    @app.get("/admin/assets", include_in_schema=False)
+    def admin_list_equipment(admin=Depends(require_admin)):
+        return equipment.list_equipment(app.state.settings.db_path)
+
+    @app.get("/admin/equipment/reservations", include_in_schema=False)
+    def admin_list_equipment_reservations_before_detail(
+        status: str | None = None,
+        member_code: str | None = None,
+        admin=Depends(require_admin),
+    ):
+        return equipment.list_reservations(
+            app.state.settings.db_path, status=status, member_code=member_code
+        )
+
+    @app.get("/admin/equipment/by-asset/{asset_no}")
+    def admin_get_equipment_by_asset(asset_no: str, admin=Depends(require_admin)):
+        return equipment.get_equipment_by_asset_no(app.state.settings.db_path, asset_no)
+
+    @app.get("/admin/equipment/{equipment_id}")
+    def admin_get_equipment(equipment_id: int, admin=Depends(require_admin)):
+        return equipment.get_equipment(app.state.settings.db_path, equipment_id)
+
+    @app.post("/admin/maintenance", status_code=201)
+    def admin_add_maintenance(body: MaintenanceCreate, admin=Depends(require_admin)):
+        return equipment.add_maintenance(
+            app.state.settings.db_path,
+            body.starts_at,
+            body.ends_at,
+            equipment_id=body.equipment_id,
+            asset_no=body.asset_no,
+            reason=body.reason,
+        )
+
+    @app.post("/admin/equipment/{equipment_id}/maintenance", status_code=201)
+    def admin_add_equipment_maintenance(
+        equipment_id: int, body: MaintenanceCreate, admin=Depends(require_admin)
+    ):
+        return equipment.add_maintenance(
+            app.state.settings.db_path,
+            body.starts_at,
+            body.ends_at,
+            equipment_id=equipment_id,
+            reason=body.reason,
+        )
+
+    @app.get("/admin/maintenance")
+    def admin_list_maintenance(active_only: bool = False, admin=Depends(require_admin)):
+        return equipment.list_maintenance(app.state.settings.db_path, active_only)
+
+    @app.api_route(
+        "/admin/maintenance/{window_id}/revoke",
+        methods=["POST", "DELETE"],
+    )
+    def admin_revoke_maintenance(window_id: int, admin=Depends(require_admin)):
+        return equipment.revoke_maintenance(app.state.settings.db_path, window_id)
+
+    # ------------------------------------------------------------ 机具：预约与交接核对
+    @app.get("/admin/reservations")
+    @app.get("/admin/equipment/reservations", include_in_schema=False)
+    def admin_list_reservations(
+        status: str | None = None,
+        member_code: str | None = None,
+        admin=Depends(require_admin),
+    ):
+        return equipment.list_reservations(
+            app.state.settings.db_path, status=status, member_code=member_code
+        )
+
+    @app.get("/admin/reservations/{reservation_id}")
+    @app.get("/admin/equipment/reservations/{reservation_id}", include_in_schema=False)
+    def admin_get_reservation(reservation_id: int, admin=Depends(require_admin)):
+        return equipment.get_reservation(app.state.settings.db_path, reservation_id)
+
+    @app.post("/admin/reservations/{reservation_id}/handover")
+    @app.post("/admin/equipment/reservations/{reservation_id}/handover", include_in_schema=False)
+    @app.post("/admin/reservations/{reservation_id}/checkout", include_in_schema=False)
+    @app.post("/admin/reservations/{reservation_id}/pickup", include_in_schema=False)
+    @app.post("/admin/reservations/{reservation_id}/collect", include_in_schema=False)
+    def admin_handover_reservation(
+        reservation_id: int,
+        body: HandoverIn | None = None,
+        admin=Depends(require_admin),
+    ):
+        body = body or HandoverIn()
+        return equipment.handover(
+            app.state.settings.db_path,
+            reservation_id,
+            equipment_ids=body.equipment_ids,
+            asset_nos=body.asset_nos,
+        )
+
+    @app.get("/admin/loans")
+    def admin_list_loans(
+        open: bool = False,
+        returned: bool = False,
+        overdue: bool = False,
+        admin=Depends(require_admin),
+    ):
+        return equipment.list_loans(
+            app.state.settings.db_path,
+            open_only=open,
+            returned_only=returned,
+            overdue_only=overdue,
+        )
+
+    @app.post("/admin/loans/{loan_id}/return")
+    @app.post("/admin/equipment/loans/{loan_id}/return", include_in_schema=False)
+    def admin_return_loan(loan_id: int, body: ReturnIn | None = None,
+                          admin=Depends(require_admin)):
+        return equipment.return_loan(app.state.settings.db_path, loan_id=loan_id)
+
+    @app.post("/admin/equipment/{equipment_id}/return")
+    def admin_return_equipment_by_pk(
+        equipment_id: int,
+        body: ReturnIn | None = None,
+        admin=Depends(require_admin),
+    ):
+        return equipment.return_loan(
+            app.state.settings.db_path, equipment_id=equipment_id
+        )
+
+    @app.post("/admin/returns")
+    @app.post("/admin/equipment/returns", include_in_schema=False)
+    def admin_return_equipment(body: ReturnIn, admin=Depends(require_admin)):
+        return equipment.return_loan(
+            app.state.settings.db_path,
+            loan_id=body.loan_id,
+            asset_no=body.asset_no,
+            equipment_id=body.equipment_id,
+        )
+
+    # ------------------------------------------------------------ 会员：成套机具预约
+    @app.post("/me/equipment/reservations", status_code=201)
+    @app.post("/me/reservations", status_code=201, include_in_schema=False)
+    @app.post("/reservations", status_code=201, include_in_schema=False)
+    def me_create_equipment_reservation(
+        body: ReservationCreate, member=Depends(require_member)
+    ):
+        return equipment.create_reservation(
+            app.state.settings.db_path,
+            member["id"],
+            body.starts_at,
+            body.ends_at,
+            [item.model_dump() for item in body.items],
+        )
+
+    @app.get("/me/equipment/reservations")
+    @app.get("/me/reservations", include_in_schema=False)
+    @app.get("/reservations", include_in_schema=False)
+    def me_list_equipment_reservations(member=Depends(require_member)):
+        return equipment.list_reservations(
+            app.state.settings.db_path, member_id=member["id"]
+        )
+
+    @app.get("/me/equipment/reservations/{reservation_id}")
+    @app.get("/me/reservations/{reservation_id}", include_in_schema=False)
+    @app.get("/reservations/{reservation_id}", include_in_schema=False)
+    def me_get_equipment_reservation(
+        reservation_id: int, member=Depends(require_member)
+    ):
+        return equipment.get_reservation(
+            app.state.settings.db_path, reservation_id, member_id=member["id"]
+        )
+
+    @app.post("/me/equipment/reservations/{reservation_id}/cancel")
+    @app.delete("/me/equipment/reservations/{reservation_id}", include_in_schema=False)
+    @app.post("/me/reservations/{reservation_id}/cancel", include_in_schema=False)
+    @app.delete("/me/reservations/{reservation_id}", include_in_schema=False)
+    @app.post("/reservations/{reservation_id}/cancel", include_in_schema=False)
+    @app.delete("/reservations/{reservation_id}", include_in_schema=False)
+    def me_cancel_equipment_reservation(
+        reservation_id: int, member=Depends(require_member)
+    ):
+        return equipment.cancel_reservation(
+            app.state.settings.db_path, reservation_id, member["id"]
         )
 
     # ------------------------------------------------------------ 会员：领凭证

@@ -140,6 +140,103 @@ CREATE TABLE IF NOT EXISTS payments (
     UNIQUE (grant_id, request_no)
 );
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+-- ---------------------------------------------------------------- 机具出借
+-- 实物机具：asset_no 是管理员登记的独立编号；标签决定可满足的清单能力。
+CREATE TABLE IF NOT EXISTS equipment (
+    id          INTEGER PRIMARY KEY,
+    asset_no    TEXT NOT NULL UNIQUE,
+    name        TEXT NOT NULL DEFAULT '',
+    created_at  TEXT NOT NULL,
+    retired_at  TEXT
+);
+
+CREATE TABLE IF NOT EXISTS equipment_tags (
+    equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
+    tag          TEXT NOT NULL,
+    PRIMARY KEY (equipment_id, tag)
+);
+CREATE INDEX IF NOT EXISTS idx_equipment_tags_tag ON equipment_tags(tag);
+
+-- 维修停用时段；撤销保留审计行，只把 status 改为 revoked。
+CREATE TABLE IF NOT EXISTS maintenance_windows (
+    id           INTEGER PRIMARY KEY,
+    equipment_id INTEGER NOT NULL REFERENCES equipment(id) ON DELETE CASCADE,
+    starts_at    TEXT NOT NULL,
+    ends_at      TEXT NOT NULL,
+    reason       TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'active'
+                 CHECK (status IN ('active', 'revoked')),
+    created_at   TEXT NOT NULL,
+    revoked_at   TEXT,
+    CHECK (starts_at < ends_at)
+);
+CREATE INDEX IF NOT EXISTS idx_maintenance_equipment
+    ON maintenance_windows(equipment_id, status);
+
+-- 会员成套预约。状态：
+-- waiting=等候；confirmed=可整套兑现但未锁序列号；cancelled=会员取消；
+-- expired=未领取且已过结束时间；collected=已一次领齐；returned=全部实物已还。
+CREATE TABLE IF NOT EXISTS reservations (
+    id           INTEGER PRIMARY KEY,
+    member_id    INTEGER NOT NULL REFERENCES members(id),
+    starts_at    TEXT NOT NULL,
+    ends_at      TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'waiting'
+                 CHECK (status IN ('waiting', 'confirmed', 'cancelled',
+                                   'expired', 'collected', 'returned')),
+    created_at   TEXT NOT NULL,
+    confirmed_at TEXT,
+    cancelled_at TEXT,
+    expired_at   TEXT,
+    collected_at TEXT,
+    returned_at  TEXT,
+    CHECK (starts_at < ends_at)
+);
+CREATE INDEX IF NOT EXISTS idx_reservations_member ON reservations(member_id, id);
+CREATE INDEX IF NOT EXISTS idx_reservations_status ON reservations(status, id);
+
+CREATE TABLE IF NOT EXISTS reservation_items (
+    id             INTEGER PRIMARY KEY,
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    ordinal        INTEGER NOT NULL,
+    label          TEXT NOT NULL DEFAULT '',
+    UNIQUE (reservation_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS reservation_item_tags (
+    item_id INTEGER NOT NULL REFERENCES reservation_items(id) ON DELETE CASCADE,
+    tag     TEXT NOT NULL,
+    PRIMARY KEY (item_id, tag)
+);
+
+-- 未领取预约的当前可行性派工方案；它不是序列号锁，每次可用性变化可整体重算/改派。
+CREATE TABLE IF NOT EXISTS reservation_assignments (
+    item_id      INTEGER PRIMARY KEY REFERENCES reservation_items(id) ON DELETE CASCADE,
+    reservation_id INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    equipment_id INTEGER NOT NULL REFERENCES equipment(id),
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reservation_assignments_res
+    ON reservation_assignments(reservation_id);
+CREATE INDEX IF NOT EXISTS idx_reservation_assignments_equip
+    ON reservation_assignments(equipment_id);
+
+-- 实物交接后的逐件借还记录。未归还行才构成硬占用；已交接实物不再参与改派。
+CREATE TABLE IF NOT EXISTS equipment_loans (
+    id                  INTEGER PRIMARY KEY,
+    reservation_id      INTEGER NOT NULL REFERENCES reservations(id),
+    reservation_item_id INTEGER NOT NULL UNIQUE REFERENCES reservation_items(id),
+    equipment_id        INTEGER NOT NULL REFERENCES equipment(id),
+    checked_out_at      TEXT NOT NULL,
+    due_at              TEXT NOT NULL,
+    returned_at         TEXT,
+    status              TEXT NOT NULL DEFAULT 'out'
+                        CHECK (status IN ('out', 'returned'))
+);
+CREATE INDEX IF NOT EXISTS idx_loans_equipment_open
+    ON equipment_loans(equipment_id, returned_at);
+CREATE INDEX IF NOT EXISTS idx_loans_reservation ON equipment_loans(reservation_id);
 """
 
 

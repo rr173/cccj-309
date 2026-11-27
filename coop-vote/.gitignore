@@ -17,4 +17,7 @@ clearing.db-shm
 demo_clearing.db
 demo_clearing.db-wal
 demo_clearing.db-shm
+demo_equipment.db
+demo_equipment.db-wal
+demo_equipment.db-shm
 bootstrap/

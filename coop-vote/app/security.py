@@ -29,13 +29,26 @@ def hash_credential(token: str, salt: str) -> str:
     return _digest("vote-credential", salt, token)
 
 
-def authenticate_member(request: Request, x_member_token: str = Header(default=None)):
-    """解析会员令牌，返回 members 行；失败返回 None（由路由决定 401）。"""
-    if not x_member_token:
+def authenticate_member(
+    request: Request,
+    x_member_token: str = Header(default=None),
+    authorization: str | None = Header(default=None),
+):
+    """解析会员令牌，返回 members 行；失败返回 None（由路由决定 401）。
+
+    主接口沿用 ``X-Member-Token``；同时兼容常见的
+    ``Authorization: Bearer <token>`` 本地调用方式。
+    """
+    token = x_member_token
+    if not token and authorization:
+        scheme, _, value = authorization.partition(" ")
+        if scheme.lower() == "bearer" and value.strip():
+            token = value.strip()
+    if not token:
         return None
     settings = request.app.state.settings
     with read(settings.db_path) as conn:
         return conn.execute(
             "SELECT * FROM members WHERE token_hash=?",
-            (hash_member_token(x_member_token, settings.credential_salt),),
+            (hash_member_token(token, settings.credential_salt),),
         ).fetchone()
